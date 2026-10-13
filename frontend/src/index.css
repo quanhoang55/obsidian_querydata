@@ -1,0 +1,1 @@
+*{box-sizing:border-box}html,body,#root{margin:0;min-width:320px;min-height:100%;width:100%}body{min-height:100vh;background:#fff}button,textarea{font:inherit}button:focus-visible,textarea:focus-visible{outline:2px solid #a7bda9;outline-offset:2px}::selection{background:#dce9de}
