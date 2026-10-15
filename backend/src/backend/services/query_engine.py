@@ -21,7 +21,7 @@ HEADER_GROUPS = {
         "nhan vien ban hang", "nguoi ban", "nguoi phu trach", "ten", "ten nhan vien", "ten nv", "ten nvkd", "ten nvbh", "ten sale",
     ),
     "product": (
-        "product", "product name", "item", "item name", "mat hang", "san pham", "ten san pham",
+        "product", "product name", "item", "item name", "mat hang", "san pham", "ten mat hang", "ten san pham",
         "ten hang", "hang hoa", "sku name",
     ),
     "amount": (
@@ -57,10 +57,18 @@ def _clean_headers(values: list[Any]) -> list[str]:
 
 def _header_group(label: str) -> str | None:
     normalized = normalize_text(label).strip()
-    for group, aliases in HEADER_GROUPS.items():
-        if normalized in aliases or any(normalized.startswith(f"{alias} ") for alias in aliases):
-            return group
-    return None
+    exact = [group for group, aliases in HEADER_GROUPS.items() if normalized in aliases]
+    if exact:
+        return exact[0]
+    # Prefer the most specific prefix. For example, "Tên mặt hàng 1" must
+    # match "tên mặt hàng" (product), rather than the shorter "tên" (person).
+    matches = [
+        (len(alias), group)
+        for group, aliases in HEADER_GROUPS.items()
+        for alias in aliases
+        if normalized.startswith(f"{alias} ")
+    ]
+    return max(matches)[1] if matches else None
 
 
 def _resolve_column(headers: list[str], requested: str | None, group: str | None = None) -> str | None:
@@ -125,36 +133,41 @@ def describe_documents(documents: list[tuple[str, str | bytes]]) -> list[dict[st
     descriptions: list[dict[str, Any]] = []
     for path, content in documents:
         if path.lower().endswith(".xlsx") and isinstance(content, bytes):
-            workbook = load_workbook(BytesIO(content), read_only=True, data_only=True)
             sheets: list[dict[str, Any]] = []
             try:
-                for worksheet in workbook.worksheets:
-                    # Header discovery only needs the opening rows; avoid materializing
-                    # thousands of transaction rows just to build Gemini's schema context.
-                    raw_rows = [
-                        tuple(row)
-                        for row in worksheet.iter_rows(min_row=1, max_row=30, values_only=True)
-                    ]
-                    nonempty_indexes = [
-                        index for index, row in enumerate(raw_rows)
-                        if any(value is not None and str(value).strip() for value in row)
-                    ]
-                    if not nonempty_indexes:
-                        continue
-                    first_index = nonempty_indexes[0]
-                    first_values = [value for value in raw_rows[first_index] if value is not None and str(value).strip()]
-                    first_is_header = len(first_values) >= 2 or any(_header_group(str(value)) for value in first_values)
-                    header_index = first_index if first_is_header else next(
-                        (
-                            index for index in nonempty_indexes[1:]
-                            if any(_header_group(str(value)) for value in raw_rows[index] if value is not None)
-                            or sum(value is not None and bool(str(value).strip()) for value in raw_rows[index]) >= 2
-                        ),
-                        first_index,
-                    )
-                    sheets.append({"name": worksheet.title, "columns": _clean_headers(list(raw_rows[header_index]))})
-            finally:
-                workbook.close()
+                workbook = load_workbook(BytesIO(content), read_only=True, data_only=True)
+                try:
+                    for worksheet in workbook.worksheets:
+                        # Header discovery only needs the opening rows; avoid materializing
+                        # thousands of transaction rows just to build Gemini's schema context.
+                        raw_rows = [
+                            tuple(row)
+                            for row in worksheet.iter_rows(min_row=1, max_row=30, values_only=True)
+                        ]
+                        nonempty_indexes = [
+                            index for index, row in enumerate(raw_rows)
+                            if any(value is not None and str(value).strip() for value in row)
+                        ]
+                        if not nonempty_indexes:
+                            continue
+                        first_index = nonempty_indexes[0]
+                        first_values = [value for value in raw_rows[first_index] if value is not None and str(value).strip()]
+                        first_is_header = len(first_values) >= 2 or any(_header_group(str(value)) for value in first_values)
+                        header_index = first_index if first_is_header else next(
+                            (
+                                index for index in nonempty_indexes[1:]
+                                if any(_header_group(str(value)) for value in raw_rows[index] if value is not None)
+                                or sum(value is not None and bool(str(value).strip()) for value in raw_rows[index]) >= 2
+                            ),
+                            first_index,
+                        )
+                        sheets.append({"name": worksheet.title, "columns": _clean_headers(list(raw_rows[header_index]))})
+                finally:
+                    workbook.close()
+            except Exception:
+                # The execution phase will report this workbook in `warnings`.
+                # A damaged or unsupported workbook must not make every query fail.
+                continue
             descriptions.append({"file": path, "sheets": sheets})
         elif path.lower().endswith(".md") and isinstance(content, str):
             rows = parse_markdown_records(path, content)

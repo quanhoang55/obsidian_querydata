@@ -2,8 +2,8 @@
 
 ## 1. Security & Local Privacy
 
-- **Prompt Privacy:** The user prompt and current date may be sent to Google Gemini only to interpret the request into a structured query plan. Never send vault data, file contents, or chat history. Read and aggregate vault data locally through the Obsidian Local REST API.
-- **Path Sanitization:** Backend must strictly validate paths to prevent directory traversal vulnerabilities outside the designated Obsidian vault folder.
+- **Prompt Privacy:** The user prompt, current date, and file names/sheet names/column headers may be sent to Google Gemini to interpret the request. Never send file rows, file contents, or chat history. Read and aggregate files locally.
+- **Path Sanitization:** The selected directory is the workspace root. Resolve every file path under that root and reject traversal or symlinks that escape it.
 
 ## 2. Backend Rules (FastAPI / Python)
 

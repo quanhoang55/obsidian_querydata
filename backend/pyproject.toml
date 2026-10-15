@@ -9,12 +9,18 @@ authors = [
 requires-python = ">=3.12"
 dependencies = [
     "fastapi[standard]>=0.143.0",
+    "duckdb>=1.2.0",
     "google-genai>=1.0.0",
     "httpx>=0.28.1",
     "openpyxl>=3.1.5",
     "pandas>=3.0.6",
     "pydantic>=2.14.0",
     "uvicorn>=0.54.0",
+]
+
+[dependency-groups]
+desktop = [
+    "pyinstaller>=6.16.0",
 ]
 
 [build-system]

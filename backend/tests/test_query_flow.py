@@ -16,7 +16,7 @@ from backend.clients.gemini import GeminiClientError
 from backend.config import Settings
 from backend.schemas.query import QueryPlan, gemini_response_schema
 from backend.services import query_service
-from backend.services.query_engine import aggregate_sales, parse_excel_records
+from backend.services.query_engine import aggregate_sales, describe_documents, parse_excel_records
 
 
 def make_plan(**overrides: object) -> QueryPlan:
@@ -39,8 +39,7 @@ def make_plan(**overrides: object) -> QueryPlan:
 
 def make_settings(**overrides: object) -> Settings:
     values: dict[str, object] = {
-        "obsidian_url": "https://127.0.0.1:27124",
-        "obsidian_key": "obsidian-test-key",
+        "vault_path": "/tmp/querydata-test-vault",
         "gemini_api_key": "gemini-test-key",
     }
     values.update(overrides)
@@ -52,8 +51,13 @@ class FakeGeminiClient:
         self.plan = plan
         self.close = AsyncMock()
 
-    async def create_query_plan(self, prompt: str) -> QueryPlan:
+    async def create_query_plan(
+        self,
+        prompt: str,
+        available_files: list[dict[str, object]] | None = None,
+    ) -> QueryPlan:
         self.prompt = prompt
+        self.available_files = available_files or []
         return self.plan
 
 
@@ -104,6 +108,15 @@ class SpreadsheetQueryTests(unittest.TestCase):
         })
         self.assertEqual(result["files_scanned"], 1)
         self.assertEqual(result["warnings"], [])
+
+    def test_ignores_an_unreadable_workbook_while_building_schema_context(self) -> None:
+        descriptions = describe_documents([
+            ("Damaged.xlsx", b"this is not an Excel workbook"),
+            ("Notes.md", "| Name | Value |\n| --- | --- |\n| Lan | 10 |"),
+        ])
+        self.assertEqual(descriptions, [
+            {"file": "Notes.md", "sheets": [{"name": "Markdown tables", "columns": ["Name", "Value"]}]},
+        ])
 
     def test_distinct_intent_lists_dynamic_column_values(self) -> None:
         content = self.make_workbook()
@@ -164,7 +177,7 @@ class SpreadsheetQueryTests(unittest.TestCase):
 
 
 class QueryServiceTests(unittest.IsolatedAsyncioTestCase):
-    async def test_invalid_gemini_response_does_not_load_vault(self) -> None:
+    async def test_invalid_gemini_response_loads_schema_context_first(self) -> None:
         fake_gemini = FakeGeminiClient(make_plan())
         fake_gemini.create_query_plan = AsyncMock(side_effect=GeminiInvalidResponseError("bad plan"))
         with (
@@ -174,10 +187,10 @@ class QueryServiceTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(GeminiInvalidResponseError):
                 await query_service.query_sales("query", make_settings())
 
-        load_docs.assert_not_awaited()
+        load_docs.assert_awaited_once()
         fake_gemini.close.assert_awaited_once()
 
-    async def test_clarification_does_not_load_vault(self) -> None:
+    async def test_clarification_uses_local_schema_context(self) -> None:
         plan = make_plan(
             person=None,
             start_date=None,
@@ -192,7 +205,7 @@ class QueryServiceTests(unittest.IsolatedAsyncioTestCase):
         ):
             result = await query_service.query_sales("Compare sales", make_settings())
 
-        load_docs.assert_not_awaited()
+        load_docs.assert_awaited_once()
         self.assertEqual(result["status"], "clarification_required")
         self.assertEqual(result["files_scanned"], 0)
         self.assertEqual(result["answer"], "Which date range should I use?")

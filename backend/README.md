@@ -1,65 +1,44 @@
-# Backend core
+# Querydata backend
 
-This prototype contains configuration, an async client for the Obsidian Local REST API, and the first FastAPI endpoints.
+The FastAPI backend reads Markdown and Excel files directly from a folder chosen by the user. For `POST /api/v1/query`, it sends the prompt and relevant local file/sheet/column metadata to Gemini. Gemini returns a typed query plan with up to two steps; Python validates it, compiles safe parameterized SQL, and executes it in an in-memory DuckDB database. File contents and calculations stay local.
 
-## Configuration
+## Environment
 
-Copy `.env.example` to `.env` and set your Local REST API URL and API key. The existing `backend/.env` is loaded automatically; shell environment variables override it.
+The backend .env contains only GEMINI_API_KEY, GEMINI_MODEL, and GEMINI_TIMEOUT.
 
-```env
-OBSIDIAN_URL=https://127.0.0.1:27124
-OBSIDIAN_KEY=your_local_rest_api_key
-PORT=8000
-GEMINI_API_KEY=your_gemini_api_key
-GEMINI_MODEL=gemini-2.5-flash
-GEMINI_TIMEOUT=90
-```
+Example values:
 
-`GEMINI_API_KEY` is required for `POST /api/v1/query`. The backend reads vault files locally, extracts only file names, sheet names, and column headers, then sends that schema metadata with the prompt and current date to Gemini. Workbook rows and chat history stay local. `GEMINI_MODEL` is optional and defaults to `gemini-2.5-flash`; `GEMINI_TIMEOUT` is optional and defaults to 90 seconds.
+    GEMINI_API_KEY=your_gemini_api_key
+    GEMINI_MODEL=your_gemini_model
+    GEMINI_TIMEOUT=90
 
-Gemini connection errors identify a network failure; provider errors include the HTTP status and provider message. The API key is redacted from error messages.
+## Run locally
 
-`PORT` controls the local API server. The Obsidian client currently disables TLS verification to support Obsidian's default self-signed local certificate. Keep the REST API bound to your local machine, or configure a trusted CA before exposing it elsewhere.
+From this directory, run uv sync and then uv run python -m backend.main.
 
-## Core usage
+Run the frontend from frontend/ with npm install and npm run dev. The UI connects to the backend through the Vite development proxy.
 
-```python
-from backend.clients.obsidian import ObsidianClient
+## Folder selection
 
-async with ObsidianClient() as obsidian:
-    status = await obsidian.health()
-    matches = await obsidian.search("sales report")
-    note = await obsidian.read_file("Reports/May.md")
-```
+Choose folder… in the frontend opens the native folder picker on the computer running the backend. The PUT /api/v1/config endpoint can also select a directory by receiving a JSON body with an absolute vault_path.
 
-The client rejects parent-directory path segments when reading a note. Install the package dependencies with `uv sync` from this directory.
+The selection is held in backend memory and must be selected again after restarting the backend. File endpoints support .md and .xlsx files below the selected root. Hidden files and folders are skipped.
 
-## Run the API
+## Endpoints
 
-```sh
-uv run python -m backend.main
-```
+- GET /health
+- GET /api/v1/config
+- PUT /api/v1/config
+- GET /api/v1/settings
+- PUT /api/v1/settings
+- POST /api/v1/vault/select
+- GET /api/v1/vault/files
+- GET /api/v1/vault/files/{path}
+- POST /api/v1/vault/search
+- POST /api/v1/query
+- GET /api/v1/query/examples
+- GET /api/v1/tags
 
-`GET /health` returns `{"status":"ok"}` when the backend is responding. It does not contact Obsidian, so it remains useful when the vault API is offline. The development frontend origins `localhost:5173` and `127.0.0.1:5173` are allowed by CORS.
+Gemini settings can be changed through `PUT /api/v1/settings` without editing `.env`. The API key is saved in macOS Keychain or Windows Credential Manager. The model and timeout are saved in the current user's application settings directory. `GET /api/v1/settings` only returns whether a key is configured; it never returns the key value.
 
-## Current API
-
-- `GET /api/v1/config` returns `obsidian_url`, `obsidian_key_configured`, `gemini_api_key_configured`, and `port`. It never returns either API key.
-- `PUT /api/v1/config` accepts `obsidian_url` and/or `obsidian_key`. Updates apply to the running process only and are not written to `.env`. URL updates must point to `localhost` or a loopback IP.
-- `GET /api/v1/vault/files` recursively lists `.md` and `.xlsx` vault paths.
-- `GET /api/v1/vault/files/{path}` returns Markdown as text or an Excel workbook as sheet names and row data. Example path: `/api/v1/vault/files/Reports/May.xlsx`.
-- `POST /api/v1/vault/search` accepts `{"query":"sales report","context_length":100}` and returns Obsidian full-text matches.
-- `POST /api/v1/query` accepts `{"prompt":"Tổng doanh số của Nam từ ngày 01/05/2026 đến 10/05/2026"}`. It supplies Gemini with the prompt and available table headers, then totals matching rows from Markdown tables and Excel sheets locally.
-- `GET /api/v1/query/examples` returns sample prompts supported by the query parser.
-- `GET /api/v1/tags` returns tag names and usage counts from Obsidian.
-
-The query flow uses Gemini to convert the prompt into a validated JSON plan with a metric, date range, salesperson, and grouping. The backend then reads supported Markdown and Excel files from Obsidian and executes the plan locally. The response includes the interpreted plan and matching source rows for review. Sales sums, counts, averages, and grouped result breakdowns are supported.
-
-If the Obsidian settings are absent from `.env`, use `PUT /api/v1/config` before calling either vault endpoint:
-
-```json
-{
-  "obsidian_url": "https://127.0.0.1:27124",
-  "obsidian_key": "your_local_rest_api_key"
-}
-```
+`POST /api/v1/query` still accepts `{"prompt":"..."}`. Successful results return a generic `result` object containing column metadata, row dictionaries, row count, and truncation status. The `plan`, `display`, `sources`, `step_results`, and `warnings` fields describe how the data was queried without exposing generated SQL.

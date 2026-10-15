@@ -6,9 +6,9 @@ from fastapi.middleware.cors import CORSMiddleware
 from backend.api.endpoints.routes import router
 
 app = FastAPI(
-    title="Obsidian Querydata API",
+    title="ObsidianQuery API",
     version="0.1.0",
-    description="Local API for querying an Obsidian vault.",
+    description="Local API for querying files in a user-selected folder.",
 )
 app.add_middleware(
     CORSMiddleware,

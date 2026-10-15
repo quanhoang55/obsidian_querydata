@@ -1,18 +1,21 @@
 # Querydata frontend
 
-Minimal local demo UI for the Querydata backend.
+Local React interface for choosing a folder and querying Markdown and Excel files through the FastAPI backend.
 
-## Run the demo
+The chat reads the query endpoint's generic `result.columns` and `result.rows` fields and displays the columns returned for each request; it does not assume a fixed sales schema.
 
-Start the backend on port `8000`, then run:
+## Run
 
-```sh
-npm install
-npm run dev
-```
+Start the backend from backend/:
 
-Open the Vite URL shown in the terminal (usually `http://localhost:5173`). During development, Vite proxies `/health` and `/api/*` to `http://127.0.0.1:8000`.
+    uv sync
+    uv run python -m backend.main
 
-The UI uses the health, config, query, vault file list/read, and vault search endpoints. Obsidian URL and key can be set from the connection settings screen; the key is held by the backend process and is never returned to the browser. Gemini credentials remain in the backend `.env` file.
+Then start the frontend from frontend/:
 
-To use a different backend origin, set `VITE_API_BASE_URL` before starting Vite.
+    npm install
+    npm run dev
+
+Open the Vite URL shown in the terminal. The development server proxies API calls to http://127.0.0.1:8000. Use Choose folder… in the interface to select an Obsidian vault or any folder containing supported .md and .xlsx files.
+
+The backend requires GEMINI_API_KEY, GEMINI_MODEL, and GEMINI_TIMEOUT in its .env. The folder choice is stored in memory until the backend restarts.

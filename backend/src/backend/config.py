@@ -38,12 +38,10 @@ def _read_env_file(path: Path) -> dict[str, str]:
 
 @dataclass(frozen=True, slots=True)
 class Settings:
-    obsidian_url: str
-    obsidian_key: str
+    vault_path: str | None = None
     gemini_api_key: str = ""
     gemini_model: str = "gemini-2.5-flash"
     port: int = 8000
-    request_timeout: float = 20.0
     gemini_timeout: float = 90.0
 
     @classmethod
@@ -51,28 +49,26 @@ class Settings:
         file_values = _read_env_file(env_file or BACKEND_DIR / ".env")
         # Real process environment always takes precedence over the file.
         values = {**file_values, **os.environ}
-        url = values.get("OBSIDIAN_URL", "").strip().rstrip("/")
-        key = values.get("OBSIDIAN_KEY", "").strip()
-        if url and not url.startswith(("https://", "http://")):
-            raise ValueError("OBSIDIAN_URL must start with http:// or https://")
+        # Desktop settings saved through the Settings API override development
+        # defaults from .env and are stored per user outside the app bundle.
+        from backend.services.app_settings_store import get_api_key, read_preferences
+
+        preferences = read_preferences()
+        stored_key = get_api_key()
         try:
-            port = int(values.get("PORT", "8000"))
-        except ValueError as exc:
-            raise ValueError("PORT must be an integer") from exc
-        if not 1 <= port <= 65535:
-            raise ValueError("PORT must be between 1 and 65535")
-        try:
-            gemini_timeout = float(values.get("GEMINI_TIMEOUT", "90"))
+            gemini_timeout = float(preferences.get("gemini_timeout", values.get("GEMINI_TIMEOUT", "90")))
         except ValueError as exc:
             raise ValueError("GEMINI_TIMEOUT must be a number of seconds") from exc
         if gemini_timeout <= 0:
             raise ValueError("GEMINI_TIMEOUT must be greater than zero")
         return cls(
-            obsidian_url=url,
-            obsidian_key=key,
-            gemini_api_key=values.get("GEMINI_API_KEY", "").strip(),
-            gemini_model=values.get("GEMINI_MODEL", "gemini-2.5-flash").strip(),
-            port=port,
+            vault_path=str(preferences.get("vault_path") or "").strip() or None,
+            gemini_api_key=(
+                stored_key
+                or ("" if preferences.get("gemini_api_key_cleared") else values.get("GEMINI_API_KEY", "").strip())
+            ),
+            gemini_model=str(preferences.get("gemini_model", values.get("GEMINI_MODEL", "gemini-2.5-flash"))).strip(),
+            port=int(values.get("OBSIDIANQUERY_PORT", "8000")),
             gemini_timeout=gemini_timeout,
         )
 

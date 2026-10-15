@@ -1,5 +1,7 @@
 # Gemini Query Layer: Implementation Plan
 
+> Superseded for query execution by [MULTI_FILE_QUERY_PLAN.md](MULTI_FILE_QUERY_PLAN.md), which describes the current multi-file structured plan and generic response. The single-step contract below is retained as historical implementation notes.
+
 ## Goal
 
 Convert a natural language prompt into a validated JSON query intent with Gemini, then execute aggregate, distinct-value, or inspect operations against Obsidian Markdown and Excel tables locally.
@@ -47,13 +49,13 @@ Convert a natural language prompt into a validated JSON query intent with Gemini
 
 ## Failure Behavior
 
-- Missing Gemini or Obsidian configuration: `503` with a configuration message.
+- Missing Gemini configuration: `503`. Missing or unavailable selected folder: `409`.
 - Gemini timeout: `504`.
 - Gemini connection failures and provider rejections return a safe diagnostic; provider responses include status/code while redacting the configured key.
-- Malformed/invalid JSON: `502`; do not scan Obsidian.
-- Obsidian connection failure: preserve the existing `503`/`504` mappings; invalid upstream data remains `502`.
+- Malformed/invalid JSON: `502`.
+- Local file access and parsing errors return a clear error without accessing paths outside the selected root.
 - Valid plan with no matching rows: `200` and `status: "no_results"`.
-- Clarification response: `200` and `status: "clarification_required"`, without vault access.
+- Clarification response: `200` and `status: "clarification_required"`. Header metadata may already have been read locally.
 
 ## Implementation Checklist
 
@@ -61,8 +63,8 @@ Convert a natural language prompt into a validated JSON query intent with Gemini
 - [x] Validate model output before passing it to local query execution.
 - [x] Send Gemini locally extracted file, worksheet, and header metadata so it can ground column selection; keep table row values local.
 - [x] Execute metrics, filters, and grouping locally and include the serialized plan in the response.
-- [x] Keep prompts as the only user data sent to Gemini; keep vault content and chat history local.
-- [x] Map Gemini and Obsidian failures to clear HTTP errors.
+- [x] Send the prompt and header metadata only; keep file contents and chat history local.
+- [x] Map Gemini and local file failures to clear HTTP errors.
 - [x] Add focused tests for schema validation, Gemini JSON handling, clarification short-circuiting, and local aggregation.
 - [x] Align the privacy rule and backend README with the Gemini flow.
 
@@ -74,8 +76,8 @@ Run from `backend/`:
 PYTHONPATH=src uv run python -m unittest discover -s tests -v
 ```
 
-Acceptance: a valid sales prompt produces a validated plan and a result computed from local vault rows; an ambiguous or unsupported prompt asks for clarification before any vault reads; malformed Gemini output produces an error and never triggers a vault scan.
+Acceptance: a valid sales prompt produces a validated plan and result computed from local files under the selected folder; an ambiguous or unsupported prompt asks for clarification; malformed Gemini output produces a clear error.
 
 ## Configuration
 
-`GEMINI_API_KEY` is required for `POST /api/v1/query`. `GEMINI_MODEL` is optional and defaults to `gemini-2.5-flash`. `GEMINI_TIMEOUT` is optional and defaults to 90 seconds. Obsidian access is required to provide local schema metadata and query data.
+`GEMINI_API_KEY` is required for `POST /api/v1/query`. `GEMINI_MODEL` is optional and defaults to `gemini-2.5-flash`. `GEMINI_TIMEOUT` is optional and defaults to 90 seconds. Select a local folder in the UI before listing or querying files.

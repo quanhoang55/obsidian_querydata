@@ -1,0 +1,14 @@
+**/.env
+**/.env.*
+!**/.env.example
+**/__pycache__/
+**/.pytest_cache/
+backend/.venv/
+backend/build/
+backend/dist/
+frontend/dist/
+frontend/node_modules/
+frontend/src-tauri/binaries/
+frontend/src-tauri/target/
+frontend/src-tauri/icons/ObsidianQuery.iconset/
+

@@ -1,19 +1,46 @@
 import { useCallback, useEffect, useRef, useState, type FormEvent, type KeyboardEvent } from 'react'
+import { invoke, isTauri } from '@tauri-apps/api/core'
+import { open } from '@tauri-apps/plugin-dialog'
 import './App.css'
 
-type Config = { obsidian_url: string | null; obsidian_key_configured: boolean; gemini_api_key_configured: boolean; port: number }
+type Config = { vault_path: string | null; gemini_api_key_configured: boolean; port: number }
+type GeminiSettings = { gemini_api_key_configured: boolean; gemini_model: string; gemini_timeout: number }
+type QueryColumn = { name: string; type: string }
 type QueryResponse = {
+  status: 'success' | 'no_results' | 'clarification_required'
   answer: string
-  rows_parsed?: number
-  matched_rows?: number
-  data?: { columns: string[]; rows: Array<{ file: string; values: Record<string, unknown> }> }
+  display: { title: string; summary: string | null; columns: string[]; visualization: string }
+  result: { columns: QueryColumn[]; rows: Array<Record<string, unknown>>; row_count: number; truncated: boolean }
+  sources: string[]
+  warnings: Array<{ file: string; message: string }>
 }
 type Message = { id: number; role: 'assistant' | 'user'; content: string; response?: QueryResponse; error?: boolean }
 type VaultFile = { path: string; type: 'markdown' | 'excel'; content?: string; sheets?: Array<{ name: string; rows: unknown[][] }> }
-const API = import.meta.env.VITE_API_BASE_URL ?? ''
+let API = import.meta.env.VITE_API_BASE_URL ?? ''
+const desktopBackendReady = (async () => {
+  if (!isTauri()) return
+  API = await invoke<string>('backend_url')
+  for (let attempt = 0; attempt < 80; attempt += 1) {
+    try {
+      const response = await fetch(`${API}/health`)
+      if (response.ok) return
+    } catch { /* The bundled backend is still starting. */ }
+    await new Promise((resolve) => window.setTimeout(resolve, 125))
+  }
+  throw new Error('The local backend did not start in time.')
+})()
 const suggestions = ['Tổng doanh số tháng này', 'Doanh số của Nam trong tuần qua', 'Mặt hàng bán ngày 11/10/2026']
+const geminiModels = [
+  { id: 'gemini-3.8-flash', label: 'Gemini 3.8 Flash · Khuyên dùng' },
+  { id: 'gemini-3.7-flash', label: 'Gemini 3.7 Flash' },
+  { id: 'gemini-3.5-flash', label: 'Gemini 3.5 Flash' },
+  { id: 'gemini-3.5-flash-lite', label: 'Gemini 3.5 Flash-Lite · Tiết kiệm' },
+  { id: 'gemini-3.1-pro-preview', label: 'Gemini 3.1 Pro · Bản xem trước' },
+  { id: 'gemini-2.5-flash', label: 'Gemini 2.5 Flash · Tương thích cũ' },
+]
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
+  await desktopBackendReady
   const response = await fetch(`${API}${path}`, { ...init, headers: { 'Content-Type': 'application/json', ...init?.headers } })
   const body = await response.json().catch(() => ({}))
   if (!response.ok) throw new Error(body.detail || `Request failed (${response.status})`)
@@ -37,15 +64,17 @@ function displayCell(value: unknown): string {
   return String(value)
 }
 
-function DataSummary({ data }: { data: NonNullable<QueryResponse['data']> }) {
-  if (!data.rows.length || !data.columns.length) return null
-  const fileCount = new Set(data.rows.map((row) => row.file)).size
+function QueryResultView({ response }: { response: QueryResponse }) {
+  const { result, display } = response
+  if (!result.rows.length || !result.columns.length) return null
+  const previewRows = result.rows.slice(0, 100)
   return <section className="data-summary" aria-label="Dữ liệu truy vấn">
-    <div className="data-summary-heading"><span className="data-summary-spark"><Icon name="spark" /></span><div><strong>Dữ liệu từ vault</strong><small>{data.rows.length} dòng · {data.columns.length} cột · {fileCount} tệp</small></div></div>
-    <div className="column-cloud">{data.columns.map((column, index) => {
-      const values = [...new Set(data.rows.map((row) => displayCell(row.values[column])).filter((value) => value !== '—'))]
-      return <div className={`column-card tone-${index % 5}`} key={column}><span className="column-name">{column}</span><div className="column-values">{values.length ? values.map((value) => <span className="value-chip" key={value}>{value}</span>) : <span className="value-empty">Không có giá trị</span>}</div></div>
-    })}</div>
+    <div className="data-summary-heading"><span className="data-summary-spark"><Icon name="spark" /></span><div><strong>{display.title}</strong><small>{result.row_count} dòng · {result.columns.length} cột · {response.sources.length} nguồn</small></div></div>
+    {display.summary && <p className="query-summary-copy">{display.summary}</p>}
+    <div className="response-table-wrap"><table className="response-table"><thead><tr>{result.columns.map((column) => <th key={column.name}>{column.name}</th>)}</tr></thead><tbody>{previewRows.map((row, index) => <tr key={index}>{result.columns.map((column) => <td key={column.name}>{displayCell(row[column.name])}</td>)}</tr>)}</tbody></table></div>
+    {(result.truncated || previewRows.length < result.row_count) && <p className="query-result-meta">Hiển thị {previewRows.length} trên {result.row_count} dòng.</p>}
+    {response.sources.length > 0 && <details className="query-result-details"><summary>Nguồn dữ liệu</summary><ul>{response.sources.map((source) => <li key={source}>{source}</li>)}</ul></details>}
+    {response.warnings.length > 0 && <details className="query-result-details query-warnings"><summary>Lưu ý ({response.warnings.length})</summary><ul>{response.warnings.map((warning, index) => <li key={`${warning.file}-${index}`}>{warning.file}: {warning.message}</li>)}</ul></details>}
   </section>
 }
 
@@ -63,10 +92,13 @@ function App() {
   const [searchText, setSearchText] = useState('')
   const [searchResults, setSearchResults] = useState<unknown[]>([])
   const [searchBusy, setSearchBusy] = useState(false)
-  const [settingsUrl, setSettingsUrl] = useState('')
-  const [settingsKey, setSettingsKey] = useState('')
+  const [settingsPath, setSettingsPath] = useState('')
+  const [geminiApiKey, setGeminiApiKey] = useState('')
+  const [geminiSettings, setGeminiSettings] = useState<GeminiSettings | null>(null)
+  const [geminiModel, setGeminiModel] = useState('gemini-3.8-flash')
   const [settingsBusy, setSettingsBusy] = useState(false)
   const [settingsNotice, setSettingsNotice] = useState('')
+  const [folderNotice, setFolderNotice] = useState('')
   const messagesEnd = useRef<HTMLDivElement>(null)
 
   const refreshConnection = useCallback(async () => {
@@ -74,9 +106,19 @@ function App() {
       const [, nextConfig] = await Promise.all([request('/health'), request<Config>('/api/v1/config')])
       setHealth('online')
       setConfig(nextConfig)
-      setSettingsUrl(nextConfig.obsidian_url || '')
+      setSettingsPath(nextConfig.vault_path || '')
     } catch {
       setHealth('offline')
+    }
+  }, [])
+
+  const refreshGeminiSettings = useCallback(async () => {
+    try {
+      const settings = await request<GeminiSettings>('/api/v1/settings')
+      setGeminiSettings(settings)
+      setGeminiModel(settings.gemini_model)
+    } catch (error) {
+      setSettingsNotice(error instanceof Error ? error.message : 'Không thể tải cài đặt Gemini.')
     }
   }, [])
 
@@ -91,6 +133,7 @@ function App() {
   }, [])
 
   useEffect(() => { void refreshConnection() }, [refreshConnection])
+  useEffect(() => { void refreshGeminiSettings() }, [refreshGeminiSettings])
   useEffect(() => { messagesEnd.current?.scrollIntoView({ behavior: 'smooth' }) }, [messages, busy])
 
   async function submitPrompt(prompt: string) {
@@ -135,44 +178,89 @@ function App() {
 
   async function saveSettings(event: FormEvent<HTMLFormElement>) {
     event.preventDefault()
-    setSettingsBusy(true); setSettingsNotice('')
-    const payload: Record<string, string> = { obsidian_url: settingsUrl.trim() }
-    if (settingsKey.trim()) payload.obsidian_key = settingsKey.trim()
+    setSettingsBusy(true); setFolderNotice('')
     try {
-      const next = await request<Config>('/api/v1/config', { method: 'PUT', body: JSON.stringify(payload) })
-      setConfig(next); setSettingsKey(''); setSettingsNotice('Đã lưu kết nối Obsidian cho phiên backend hiện tại.')
-      await refreshConnection()
-    } catch (error) { setSettingsNotice(error instanceof Error ? error.message : 'Không thể lưu cấu hình.') }
+      const next = await request<Config>('/api/v1/config', {
+        method: 'PUT',
+        body: JSON.stringify({ vault_path: settingsPath.trim() }),
+      })
+      setConfig(next)
+      setSettingsPath(next.vault_path || '')
+      setFolderNotice('Đã chọn thư mục làm thư mục dữ liệu.')
+    } catch (error) { setFolderNotice(error instanceof Error ? error.message : 'Không thể chọn thư mục.') }
     finally { setSettingsBusy(false) }
+  }
+
+  async function saveGeminiSettings(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault()
+    setSettingsBusy(true); setSettingsNotice('')
+    try {
+      const body: { gemini_model: string; gemini_api_key?: string } = { gemini_model: geminiModel }
+      if (geminiApiKey.trim()) body.gemini_api_key = geminiApiKey.trim()
+      const updated = await request<GeminiSettings>('/api/v1/settings', {
+        method: 'PUT',
+        body: JSON.stringify(body),
+      })
+      setGeminiSettings(updated)
+      setGeminiApiKey('')
+      setSettingsNotice('Đã lưu cài đặt Gemini.')
+    } catch (error) {
+      setSettingsNotice(error instanceof Error ? error.message : 'Không thể lưu cài đặt Gemini.')
+    } finally { setSettingsBusy(false) }
+  }
+
+  async function chooseFolder() {
+    setSettingsBusy(true); setFolderNotice('')
+    try {
+      const next = isTauri()
+        ? await (async () => {
+            const selected = await open({ directory: true, multiple: false, title: 'Chọn thư mục dữ liệu' })
+            if (!selected) return { cancelled: true, ...(config ?? { vault_path: null, gemini_api_key_configured: false, port: 0 }) }
+            const updated = await request<Config>('/api/v1/config', {
+              method: 'PUT',
+              body: JSON.stringify({ vault_path: selected }),
+            })
+            return { cancelled: false, ...updated }
+          })()
+        : await request<Config & { cancelled: boolean }>('/api/v1/vault/select', { method: 'POST' })
+      if (!next.cancelled) {
+        setConfig(next)
+        setSettingsPath(next.vault_path || '')
+        setFolderNotice('Đã chọn thư mục làm thư mục dữ liệu.')
+      }
+    } catch (error) {
+      setFolderNotice(error instanceof Error ? error.message : 'Không thể mở hộp thoại chọn thư mục.')
+    } finally { setSettingsBusy(false) }
   }
 
   const visibleFiles = files.filter((path) => path.toLowerCase().includes(fileFilter.toLowerCase()))
 
   return <main className="app-shell">
     <aside className="sidebar">
-      <a className="brand" href="#home" aria-label="Querydata home"><span className="brand-mark"><Icon name="spark" /></span><span>query<span className="brand-light">data</span></span></a>
+      <a className="brand" href="#home" aria-label="ObsidianQuery home"><span className="brand-mark"><Icon name="spark" /></span><span>Obsidian<span className="brand-light">Query</span></span></a>
       <button className="new-chat" onClick={resetChat} type="button"><Icon name="plus" /><span>Cuộc trò chuyện mới</span></button>
       <div className="sidebar-label">Workspace</div>
       <button className={`nav-item ${panel === null ? 'active' : ''}`} onClick={() => setPanel(null)} type="button"><Icon name="spark" /> Trợ lý truy vấn</button>
-      <button className={`nav-item ${panel === 'files' ? 'active' : ''}`} onClick={() => { setPanel('files'); setSelectedFile(null); void refreshFiles() }} type="button"><Icon name="files" /> Tệp trong vault</button>
-      <button className={`nav-item ${panel === 'settings' ? 'active' : ''}`} onClick={() => { setPanel('settings'); setSettingsNotice('') }} type="button"><Icon name="settings" /> Kết nối Obsidian</button>
+      <button className={`nav-item ${panel === 'files' ? 'active' : ''}`} onClick={() => { setPanel('files'); setSelectedFile(null); void refreshFiles() }} type="button"><Icon name="files" /> Tệp trong thư mục</button>
+      <button className={`nav-item ${panel === 'settings' ? 'active' : ''}`} onClick={() => { setPanel('settings'); setSettingsNotice(''); setFolderNotice('') }} type="button"><Icon name="settings" /> Cài đặt</button>
       <div className="sidebar-bottom">
-        <button className="vault-card" type="button" onClick={() => setPanel('settings')}><span className="vault-icon">⌘</span><span className="vault-label"><strong>Obsidian vault</strong><small>{config?.obsidian_url || 'Chưa cấu hình'}</small></span><span className={`status-dot ${health}`} /></button>
+        <button className="vault-card" type="button" onClick={() => setPanel('settings')}><span className="vault-icon">⌘</span><span className="vault-label"><strong>Thư mục dữ liệu</strong><small>{config?.vault_path || 'Chưa chọn thư mục'}</small></span><span className={`status-dot ${health}`} /></button>
         <div className="sidebar-foot"><span className={`health-indicator ${health}`} />{health === 'online' ? 'Backend đang hoạt động' : health === 'checking' ? 'Đang kiểm tra backend…' : 'Không kết nối được backend'}</div>
       </div>
     </aside>
 
     <section className="main-panel" id="home">
-      <header className="topbar"><div className="breadcrumb">Workspace <span className="crumb-divider">/</span> <span>{panel === 'files' ? 'Vault' : panel === 'settings' ? 'Kết nối' : 'Chat'}</span></div><div className="topbar-right"><span className={`local-badge ${health}`}><span />{health === 'online' ? 'Backend online' : health === 'checking' ? 'Đang kết nối' : 'Backend offline'}</span><button className="icon-button" aria-label="Cấu hình kết nối" title="Cấu hình kết nối" onClick={() => { setPanel('settings'); setSettingsNotice('') }} type="button"><Icon name="settings" /></button></div></header>
+      <header className="topbar"><div className="breadcrumb">Workspace <span className="crumb-divider">/</span> <span>{panel === 'files' ? 'Vault' : panel === 'settings' ? 'Cài đặt' : 'Chat'}</span></div><div className="topbar-right"><span className={`local-badge ${health}`}><span />{health === 'online' ? 'Backend online' : health === 'checking' ? 'Đang kết nối' : 'Backend offline'}</span><button className="icon-button" aria-label="Mở cài đặt" title="Cài đặt" onClick={() => { setPanel('settings'); setSettingsNotice(''); setFolderNotice('') }} type="button"><Icon name="settings" /></button></div></header>
 
-      {panel === 'settings' ? <section className="utility-page"><div className="page-heading"><span className="page-icon"><Icon name="settings" /></span><div><p className="eyebrow">KẾT NỐI</p><h1>Cấu hình workspace</h1><p>Kết nối giao diện với backend và Obsidian Local REST API.</p></div></div>
-        <form className="settings-card" onSubmit={(event) => void saveSettings(event)}><label>Obsidian API URL<input value={settingsUrl} onChange={(event) => setSettingsUrl(event.target.value)} placeholder="https://127.0.0.1:27124" required /></label><label>Obsidian API key<input type="password" value={settingsKey} onChange={(event) => setSettingsKey(event.target.value)} placeholder={config?.obsidian_key_configured ? 'Đã cấu hình · để trống để giữ nguyên' : 'Nhập API key'} autoComplete="new-password" /></label><div className="config-status"><span><i className={config?.obsidian_key_configured ? 'configured' : ''} />Obsidian key {config?.obsidian_key_configured ? 'đã cấu hình' : 'chưa cấu hình'}</span><span><i className={config?.gemini_api_key_configured ? 'configured' : ''} />Gemini {config?.gemini_api_key_configured ? 'đã cấu hình' : 'chưa cấu hình'}</span></div><button className="primary-button" disabled={settingsBusy}>{settingsBusy ? 'Đang lưu…' : 'Lưu cấu hình'}</button>{settingsNotice && <p className="inline-notice" role="status">{settingsNotice}</p>}<p className="form-hint">Cấu hình được lưu trong bộ nhớ backend đến khi tiến trình khởi động lại. GEMINI_API_KEY vẫn được đọc từ file .env.</p></form></section>
-      : panel === 'files' ? <section className="vault-page"><div className="vault-heading"><div><p className="eyebrow">OBSIDIAN VAULT</p><h1>Tệp của bạn</h1><p>{files.length} tệp Markdown và Excel</p></div><button className="quiet-button" onClick={() => { setSelectedFile(null); void refreshFiles() }} type="button">Làm mới</button></div><form className="file-search" onSubmit={(event) => void runSearch(event)}><Icon name="search" /><input aria-label="Tìm kiếm trong vault" placeholder="Tìm nội dung trong vault..." value={searchText} onChange={(event) => setSearchText(event.target.value)} /><button type="submit" disabled={searchBusy}>{searchBusy ? 'Đang tìm…' : 'Tìm'}</button></form>
+      {panel === 'settings' ? <section className="utility-page"><div className="page-heading"><span className="page-icon"><Icon name="settings" /></span><div><p className="eyebrow">THIẾT LẬP ỨNG DỤNG</p><h1>Cài đặt</h1><p>Quản lý thư mục dữ liệu và kết nối Gemini.</p></div></div>
+        <form className="settings-card" onSubmit={(event) => void saveSettings(event)}><h2 className="settings-section-title">Thư mục dữ liệu</h2><label>Đường dẫn thư mục<input value={settingsPath} onChange={(event) => setSettingsPath(event.target.value)} placeholder="/Users/you/Documents/Obsidian Vault" required /></label><div className="folder-actions"><button className="primary-button" type="button" disabled={settingsBusy} onClick={() => void chooseFolder()}>{settingsBusy ? 'Đang mở…' : 'Chọn thư mục…'}</button><button className="quiet-button" type="submit" disabled={settingsBusy}>Dùng đường dẫn này</button></div>{folderNotice && <p className="inline-notice" role="status">{folderNotice}</p>}<p className="form-hint">Hỗ trợ tệp Markdown và Excel trong thư mục đã chọn.</p></form>
+        <form className="settings-card gemini-settings-card" onSubmit={(event) => void saveGeminiSettings(event)}><h2 className="settings-section-title">Gemini</h2><label>API key<input type="password" autoComplete="new-password" value={geminiApiKey} onChange={(event) => setGeminiApiKey(event.target.value)} placeholder={geminiSettings?.gemini_api_key_configured ? 'Đã lưu API key · nhập để thay đổi' : 'Nhập Gemini API key'} /></label><label>Mô hình<select value={geminiModel} onChange={(event) => setGeminiModel(event.target.value)}>{!geminiModels.some((model) => model.id === geminiModel) && <option value={geminiModel}>{geminiModel} · Đang sử dụng</option>}{geminiModels.map((model) => <option key={model.id} value={model.id}>{model.label}</option>)}</select></label><p className="config-status"><span><i className={geminiSettings?.gemini_api_key_configured ? 'configured' : ''} />{geminiSettings?.gemini_api_key_configured ? 'API key đã được cấu hình' : 'Chưa có API key'}</span></p><button className="primary-button" type="submit" disabled={settingsBusy || !geminiSettings}>{settingsBusy ? 'Đang lưu…' : 'Lưu cài đặt Gemini'}</button>{settingsNotice && <p className="inline-notice" role="status">{settingsNotice}</p>}<p className="form-hint">Để trống API key nếu bạn chỉ muốn đổi mô hình. API key được lưu riêng và không hiển thị lại.</p></form></section>
+      : panel === 'files' ? <section className="vault-page"><div className="vault-heading"><div><p className="eyebrow">THƯ MỤC ĐÃ CHỌN</p><h1>Tệp của bạn</h1><p>{files.length} tệp Markdown và Excel</p></div><button className="quiet-button" onClick={() => { setSelectedFile(null); void refreshFiles() }} type="button">Làm mới</button></div><form className="file-search" onSubmit={(event) => void runSearch(event)}><Icon name="search" /><input aria-label="Tìm kiếm trong thư mục" placeholder="Tìm nội dung trong thư mục..." value={searchText} onChange={(event) => setSearchText(event.target.value)} /><button type="submit" disabled={searchBusy}>{searchBusy ? 'Đang tìm…' : 'Tìm'}</button></form>
         {searchResults.length > 0 && <div className="search-results"><div className="section-caption">KẾT QUẢ TÌM KIẾM <button type="button" onClick={() => setSearchResults([])}>Xóa</button></div>{searchResults.slice(0, 8).map((result, index) => <pre key={index}>{typeof result === 'string' ? result : JSON.stringify(result, null, 2)}</pre>)}</div>}
         <div className="file-layout"><div className="file-list-pane"><div className="file-filter"><Icon name="search" /><input aria-label="Lọc danh sách tệp" placeholder="Lọc tệp..." value={fileFilter} onChange={(event) => setFileFilter(event.target.value)} /></div><div className="file-list">{visibleFiles.map((path) => <button key={path} type="button" className={`file-row ${selectedFile?.path === path ? 'selected' : ''}`} onClick={() => void openFile(path)}><span className={`file-type ${path.endsWith('.xlsx') ? 'excel' : ''}`}>{path.endsWith('.xlsx') ? 'XLS' : 'MD'}</span><span>{path}</span></button>)}{!visibleFiles.length && <p className="empty-note">{health === 'offline' ? 'Kết nối backend để tải tệp.' : 'Không tìm thấy tệp phù hợp.'}</p>}</div></div><div className="file-preview">{fileLoading ? <p className="empty-note">Đang tải tệp…</p> : selectedFile ? <><div className="preview-title"><span className={`file-type ${selectedFile.type === 'excel' ? 'excel' : ''}`}>{selectedFile.type === 'excel' ? 'XLS' : 'MD'}</span><strong>{selectedFile.path}</strong></div>{selectedFile.type === 'markdown' ? <pre className="markdown-preview">{selectedFile.content}</pre> : selectedFile.sheets?.map((sheet) => <div className="sheet" key={sheet.name}><strong>{sheet.name}</strong><div className="table-scroll"><table><tbody>{sheet.rows.slice(0, 100).map((row, index) => <tr key={index}>{row.map((cell, cellIndex) => <td key={cellIndex}>{String(cell ?? '')}</td>)}</tr>)}</tbody></table></div></div>)}</> : <div className="preview-empty"><span><Icon name="files" /></span><p>Chọn một tệp để xem nội dung</p></div>}</div></div>
       </section>
       : <><div className={`conversation ${messages.length ? 'has-messages' : ''}`}>
-        {messages.length === 0 ? <div className="welcome"><div className="welcome-icon"><Icon name="spark" /></div><p className="eyebrow">OBSIDIAN QUERY ASSISTANT</p><h1>Hôm nay bạn muốn<br /><span>tìm hiểu điều gì?</span></h1><p className="welcome-copy">Hỏi về dữ liệu trong vault của bạn.<br />Câu trả lời được xử lý qua backend cục bộ.</p><div className="suggestions">{suggestions.map((suggestion) => <button key={suggestion} type="button" onClick={() => void submitPrompt(suggestion)}>{suggestion}<span>↗</span></button>)}</div></div>
+        {messages.length === 0 ? <div className="welcome"><div className="welcome-icon"><Icon name="spark" /></div><p className="eyebrow">LOCAL FILE QUERY ASSISTANT</p><h1>Hôm nay bạn muốn<br /><span>tìm hiểu điều gì?</span></h1><p className="welcome-copy">Chọn một thư mục rồi hỏi về dữ liệu trong các tệp Markdown và Excel.<br />Chỉ yêu cầu diễn giải được gửi tới Gemini.</p><div className="suggestions">{suggestions.map((suggestion) => <button key={suggestion} type="button" onClick={() => void submitPrompt(suggestion)}>{suggestion}<span>↗</span></button>)}</div></div>
           : <div className="message-list" aria-live="polite">
             {messages.map((message) => (
               <article className={`message ${message.role}`} key={message.id}>
@@ -180,7 +268,7 @@ function App() {
                 <div className="message-content">
                   <span className="message-author">{message.role === 'user' ? 'Bạn' : 'Querydata'}</span>
                   <p className={message.error ? 'error-copy' : 'assistant-copy'}>{message.content}</p>
-                  {message.response?.data && <DataSummary data={message.response.data} />}
+                  {message.response && <QueryResultView response={message.response} />}
                 </div>
               </article>
             ))}

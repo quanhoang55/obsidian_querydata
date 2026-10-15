@@ -1,124 +1,138 @@
-"""Interpret query prompts and execute validated plans against Obsidian data."""
+"""Orchestrate schema discovery, Gemini planning, and local SQL execution."""
 
 from __future__ import annotations
 
 import asyncio
-import re
 from typing import Any
 
-from backend.clients.gemini import GeminiClient
-from backend.clients.obsidian import ObsidianClient
+from backend.clients.gemini import GeminiClient, GeminiInvalidResponseError
 from backend.config import Settings
-from backend.schemas.query import QueryPlan
-from backend.services.query_engine import aggregate_sales, describe_documents, normalize_text
+from backend.schemas.query import CombinePlan, MultiFileQueryPlan
+from backend.services.local_vault import LocalVault, VaultNotSelectedError
+from backend.services.query_compiler import InvalidQueryPlan, validate_plan
+from backend.services.query_executor import execute_plan
+from backend.services.query_engine import normalize_text
+from backend.services.schema_catalog import build_schema_catalog
 
 
-class ObsidianConfigurationError(Exception):
-    """Obsidian credentials are needed to execute a valid query plan."""
+class VaultConfigurationError(Exception):
+    """A local vault folder has not been selected or is unavailable."""
 
 
-async def query_sales(prompt: str, settings: Settings) -> dict[str, Any]:
-    """Read vault schemas, interpret against them, and execute the plan locally."""
-    documents = await _load_vault_documents(settings)
-    available_files = describe_documents(documents)
-    prompt_schemas = _schemas_for_prompt(prompt, available_files)
+async def query_files(prompt: str, settings: Settings) -> dict[str, Any]:
+    """Interpret a prompt against the local schema catalog and execute its plan."""
+    try:
+        vault = LocalVault(settings.vault_path)
+    except VaultNotSelectedError as error:
+        raise VaultConfigurationError(str(error)) from error
+    catalog = await asyncio.to_thread(build_schema_catalog, vault)
+    relevant_catalog = _catalog_for_prompt(prompt, catalog)
+
     gemini = GeminiClient(settings)
     try:
-        plan = await gemini.create_query_plan(prompt, prompt_schemas)
+        plan = await gemini.create_query_plan(prompt, relevant_catalog["files"])
+    except GeminiInvalidResponseError as error:
+        # Malformed model output is a clarification case, never an executable plan.
+        question = (
+            f"I understood your request as: ‘{prompt}’. Is that interpretation correct? "
+            "Please confirm and specify the exact file, column, or calculation if you meant a particular one."
+        )
+        clarification_plan = MultiFileQueryPlan(
+            status="clarification_required",
+            clarification_needed=True,
+            clarification_question=question,
+        )
+        return _clarification_response(
+            prompt,
+            clarification_plan,
+            [*catalog.get("warnings", []), {"file": "Gemini", "message": str(error)}],
+        )
     finally:
         await gemini.close()
 
-    plan = _apply_explicit_column_wildcard(prompt, plan, prompt_schemas)
-    if plan.clarification_needed:
-        return _clarification_response(prompt, plan)
+    if plan.status == "clarification_required":
+        return _clarification_response(prompt, plan, catalog.get("warnings", []))
+    try:
+        validate_plan(plan, catalog)
+    except InvalidQueryPlan as error:
+        return _clarification_response(prompt, plan, [
+            *catalog.get("warnings", []),
+            {"file": "query", "message": str(error)},
+        ], question="I could not safely map the request to the available file schemas. Please clarify the file, sheet, or column.")
 
-    result = aggregate_sales(prompt, documents, plan.model_dump(mode="json"))
-    result["query_plan"] = plan.model_dump(mode="json")
+    result = await asyncio.to_thread(execute_plan, vault, plan, catalog)
+    result["query"] = prompt
     return result
 
 
-def _schemas_for_prompt(
-    prompt: str,
-    available_files: list[dict[str, object]],
-) -> list[dict[str, object]]:
-    """Keep schema context focused on an explicitly named vault file."""
-    match = re.search(r"((?:[\w().-]+/)*[\w().-]+\.(?:xlsx|md))\b", prompt, re.IGNORECASE)
-    if not match:
-        return available_files
-    requested = match.group(1).replace("\\", "/").casefold()
+def _catalog_for_prompt(prompt: str, catalog: dict[str, Any], max_sheets: int = 40) -> dict[str, Any]:
+    """Focus Gemini context on prompt-matching sheets while keeping explicit files."""
+    available = catalog.get("files", [])
+    prompt_path = prompt.replace("\\", "/").casefold()
     selected = [
-        file_info for file_info in available_files
-        if str(file_info.get("file", "")).replace("\\", "/").casefold() == requested
+        item for item in available
+        if str(item.get("file_path", "")).replace("\\", "/").casefold() in prompt_path
     ]
-    return selected or available_files
+    if selected:
+        return {"files": selected, "warnings": catalog.get("warnings", [])}
 
-
-def _apply_explicit_column_wildcard(
-    prompt: str,
-    plan: QueryPlan,
-    available_files: list[dict[str, object]],
-) -> QueryPlan:
-    """Resolve explicit header-prefix requests against real headers before execution."""
-    wildcard = re.search(r"([^\s,;?*]+)\*", prompt)
-    if not wildcard:
-        return plan
-
-    prefix = normalize_text(wildcard.group(1).strip("`'\""))
-    columns = list(dict.fromkeys(
-        str(column)
-        for file_info in available_files
-        if isinstance(file_info.get("sheets"), list)
-        for sheet in file_info["sheets"]
-        if isinstance(sheet, dict) and isinstance(sheet.get("columns"), list)
-        for column in sheet["columns"]
-        if normalize_text(str(column)).startswith(prefix)
-    ))
-    if len(columns) == 1:
-        update: dict[str, Any] = {"target_column": columns[0], "display_columns": [columns[0]]}
-        if plan.operation == "aggregate":
-            update["operation"] = "distinct"
-            update["metric"] = None
-        return plan.model_copy(update=update)
-    if len(columns) > 1:
-        question = f"Which column do you mean: {', '.join(columns)}?"
+    tokens = {
+        token for token in normalize_text(prompt).split()
+        if len(token) > 1 and token not in {"tat", "cac", "trong", "cua", "theo", "ngay", "thang", "nam", "from", "with", "the", "all", "list"}
+    }
+    ranked: list[tuple[int, int, dict[str, Any]]] = []
+    index = 0
+    for file_entry in available:
+        for sheet in file_entry.get("sheets", []):
+            terms = set(normalize_text(
+                str(file_entry.get("file_path", "")) + " " + str(sheet.get("name", "")) + " " + " ".join(
+                    str(value)
+                    for column in sheet.get("columns", [])
+                    for value in [column.get("name", ""), *column.get("aliases", [])]
+                )
+            ).split())
+            score = len(tokens.intersection(terms))
+            ranked.append((score, index, {"file_path": file_entry["file_path"], "sheets": [sheet]}))
+            index += 1
+    if len(ranked) <= max_sheets:
+        selected_sheets = [item for _, _, item in ranked]
     else:
-        question = f"I couldn't find a column starting with '{wildcard.group(1)}' in the available files. Which column should I use?"
-    return plan.model_copy(update={
-        "clarification_needed": True,
-        "clarification_question": question,
-    })
+        ranked.sort(key=lambda item: (-item[0], item[1]))
+        selected_sheets = [item for _, _, item in ranked[:max_sheets]]
+    merged: dict[str, dict[str, Any]] = {}
+    for item in selected_sheets:
+        merged.setdefault(item["file_path"], {"file_path": item["file_path"], "sheets": []})
+        merged[item["file_path"]]["sheets"].extend(item["sheets"])
+    return {"files": list(merged.values()), "warnings": catalog.get("warnings", [])}
 
 
-def _clarification_response(prompt: str, plan: QueryPlan) -> dict[str, Any]:
+def _clarification_response(
+    prompt: str,
+    plan: MultiFileQueryPlan,
+    warnings: list[dict[str, str]],
+    question: str | None = None,
+) -> dict[str, Any]:
+    clarification_question = question or plan.clarification_question or "Please clarify which columns or files to query."
+    response_plan = plan
+    if plan.status == "ready":
+        response_plan = plan.model_copy(update={
+            "status": "clarification_required",
+            "steps": [],
+            "combine": CombinePlan(
+                operation="none", left_step=None, right_step=None,
+                left_column=None, right_column=None, join_type=None,
+            ),
+            "clarification_needed": True,
+            "clarification_question": clarification_question,
+        })
     return {
         "status": "clarification_required",
         "query": prompt,
-        "answer": plan.clarification_question or "Please clarify what sales data you want to query.",
-        "query_plan": plan.model_dump(mode="json"),
-        "files_scanned": 0,
-        "rows_parsed": 0,
-        "matched_rows": 0,
-        "total": 0,
-        "grouped_results": {},
-        "data": {"columns": [], "rows": []},
-        "warnings": [],
+        "answer": clarification_question,
+        "plan": response_plan.model_dump(mode="json", by_alias=True),
+        "display": response_plan.display.model_dump(mode="json"),
+        "result": {"columns": [], "rows": [], "row_count": 0, "truncated": False},
+        "step_results": [],
+        "sources": [],
+        "warnings": warnings,
     }
-
-
-async def _load_vault_documents(settings: Settings) -> list[tuple[str, str | bytes]]:
-    """Fetch supported Markdown and Excel files with bounded concurrency."""
-    if not settings.obsidian_url or not settings.obsidian_key:
-        raise ObsidianConfigurationError("Configure OBSIDIAN_URL and OBSIDIAN_KEY before querying the vault")
-
-    async with ObsidianClient(settings) as obsidian:
-        paths = await obsidian.list_supported_files()
-        semaphore = asyncio.Semaphore(8)
-
-        async def read_document(path: str) -> tuple[str, str | bytes]:
-            async with semaphore:
-                content = await obsidian.read_file_bytes(path)
-            if path.lower().endswith(".md"):
-                return path, content.decode("utf-8")
-            return path, content
-
-        return list(await asyncio.gather(*(read_document(path) for path in paths)))
