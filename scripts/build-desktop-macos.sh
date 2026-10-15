@@ -12,8 +12,12 @@ if ! npm run tauri build -- --bundles dmg; then
   echo "Tauri's DMG tool failed; creating a compatible HFS disk image fallback."
   app_path="$project_root/frontend/src-tauri/target/release/bundle/macos/ObsidianQuery.app"
   architecture="$(uname -m)"
+  if [[ "$architecture" == "arm64" ]]; then
+    architecture="aarch64"
+  fi
   staging_dir="$(mktemp -d /tmp/obsidianquery-dmg.XXXXXX)"
-  output_path="$project_root/frontend/src-tauri/target/release/bundle/dmg/ObsidianQuery_0.1.0_${architecture}.dmg"
+  app_version="$(python3 -c 'import json; print(json.load(open("src-tauri/tauri.conf.json"))["version"])')"
+  output_path="$project_root/frontend/src-tauri/target/release/bundle/dmg/ObsidianQuery_${app_version}_${architecture}.dmg"
   temporary_output="${staging_dir}.dmg"
   codesign --force --deep --sign - "$app_path"
   ditto "$app_path" "$staging_dir/ObsidianQuery.app"

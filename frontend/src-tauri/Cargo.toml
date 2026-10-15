@@ -1,6 +1,6 @@
 [package]
 name = "obsidianquery"
-version = "0.1.0"
+version = "0.1.1"
 description = "Local Excel and Markdown query assistant"
 authors = ["quanhoang"]
 edition = "2021"
