@@ -58,11 +58,13 @@ pub fn run() {
     app.run(|handle, event| {
         if matches!(event, tauri::RunEvent::Exit) {
             let state = handle.state::<BackendState>();
-            if let Ok(mut child) = state.child.lock() {
-                if let Some(process) = child.take() {
-                    let _ = process.kill();
+            {
+                if let Ok(mut child) = state.child.lock() {
+                    if let Some(process) = child.take() {
+                        let _ = process.kill();
+                    }
                 }
-            }
+            };
         }
     });
 }

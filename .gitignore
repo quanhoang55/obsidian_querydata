@@ -4,6 +4,8 @@
 **/__pycache__/
 **/.pytest_cache/
 backend/.venv/
+backend/.uv-cache/
+backend/.pyinstaller/
 backend/build/
 backend/dist/
 frontend/dist/

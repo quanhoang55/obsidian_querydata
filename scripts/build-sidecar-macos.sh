@@ -4,6 +4,8 @@ set -euo pipefail
 project_root="$(cd "$(dirname "$0")/.." && pwd)"
 target_triple="$(rustc -vV | sed -n 's/^host: //p')"
 binary_name="obsidianquery-backend-${target_triple}"
+export UV_CACHE_DIR="${UV_CACHE_DIR:-$project_root/backend/.uv-cache}"
+export PYINSTALLER_CONFIG_DIR="${PYINSTALLER_CONFIG_DIR:-$project_root/backend/.pyinstaller}"
 
 cd "$project_root/backend"
 uv sync --group desktop

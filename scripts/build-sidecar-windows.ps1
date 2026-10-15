@@ -3,6 +3,12 @@ $ErrorActionPreference = "Stop"
 $ProjectRoot = Split-Path -Parent $PSScriptRoot
 $TargetTriple = (rustc -vV | Select-String '^host: ').ToString().Replace('host: ', '').Trim()
 $BinaryName = "obsidianquery-backend-$TargetTriple"
+if (-not $env:UV_CACHE_DIR) {
+  $env:UV_CACHE_DIR = Join-Path $ProjectRoot "backend/.uv-cache"
+}
+if (-not $env:PYINSTALLER_CONFIG_DIR) {
+  $env:PYINSTALLER_CONFIG_DIR = Join-Path $ProjectRoot "backend/.pyinstaller"
+}
 
 Push-Location "$ProjectRoot/backend"
 try {
